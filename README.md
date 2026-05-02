@@ -12,7 +12,7 @@ Synthesizing Chizat's WFR particle method with Shugart's negative-stepsize GDA t
 ![Bilinear CP-MDA](gifs/cpmda_bilinear.gif)
 
 **Convex-Concave**
-![CC CP-MDA](gifs/cpmda_convex_concave.gif)
+![CC CP-MDA](gifs/cpmda_cc.gif)
 
 **SC-SC**
 ![SCSC CP-MDA](gifs/cpmda_scsc.gif)
@@ -23,7 +23,7 @@ Synthesizing Chizat's WFR particle method with Shugart's negative-stepsize GDA t
 ![Bilinear CP-MP](gifs/cpmp_bilinear.gif)
 
 **Convex-Concave**
-![CC CP-MP](gifs/cpmp_convex_concave.gif)
+![CC CP-MP](gifs/cpmp_cc.gif)
 
 **SC-SC**
 ![SCSC CP-MP](gifs/cpmp_scsc.gif)
