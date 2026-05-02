@@ -8,18 +8,27 @@ Synthesizing Chizat's WFR particle method with Shugart's negative-stepsize GDA t
 
 ### CP-MDA (Mirror Descent-Ascent)
 
-| Bilinear | Convex-Concave | SC-SC |
-|:---:|:---:|:---:|
-| ![Bilinear CP-MDA](gifs/cpmda_bilinear.gif) | ![CC CP-MDA](gifs/cpmda_convex_concave.gif) | ![SCSC CP-MDA](gifs/cpmda_scsc.gif) |
+**Bilinear**
+![Bilinear CP-MDA](gifs/cpmda_bilinear.gif)
+
+**Convex-Concave**
+![CC CP-MDA](gifs/cpmda_convex_concave.gif)
+
+**SC-SC**
+![SCSC CP-MDA](gifs/cpmda_scsc.gif)
 
 ### CP-MP (Mirror Prox)
 
-| Bilinear | Convex-Concave | SC-SC |
-|:---:|:---:|:---:|
-| ![Bilinear CP-MP](gifs/cpmp_bilinear.gif) | ![CC CP-MP](gifs/cpmp_convex_concave.gif) | ![SCSC CP-MP](gifs/cpmp_scsc.gif) |
+**Bilinear**
+![Bilinear CP-MP](gifs/cpmp_bilinear.gif)
 
-Each animation shows: **(left)** Hamiltonian landscape with weighted particle positions and barycenter trajectory; **(middle)** per-player probability mass histograms; **(right)** strategy entropy over time. Entropy decaying to 0 indicates correct mass collapse to the Nash equilibrium Dirac delta.
+**Convex-Concave**
+![CC CP-MP](gifs/cpmp_convex_concave.gif)
 
+**SC-SC**
+![SCSC CP-MP](gifs/cpmp_scsc.gif)
+
+Each animation shows: **(left)** Hamiltonian landscape with weighted particle positions and barycenter trajectory; **(middle)** per-player probability mass histograms; **(right)** strategy entropy over time. Results are shown for three test games — bilinear, convex-concave, and SC-SC — each with its respective scheduler. Entropy decaying to 0 indicates correct mass collapse to the Nash equilibrium Dirac delta.
 ---
 
 ## Structure
