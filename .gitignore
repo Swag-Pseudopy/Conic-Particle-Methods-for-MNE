@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Conda / virtual envs
+.conda/
+.env
+*.egg-info/
+dist/
+build/
+
+# Claude Code internals
+.claude/

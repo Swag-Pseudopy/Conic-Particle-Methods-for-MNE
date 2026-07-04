@@ -1,0 +1,3 @@
+game,algo_L,stepsize_mode,init_mode,seed,iters,final_duality_gap,gap_log_linear_rate,final_w2_sum,w2_log_linear_rate,final_entropy_a,final_entropy_b,final_barycenter_x,final_barycenter_y,csv_path
+bilinear,1,vanilla,uniform,0,2000,179.93310824744574,1.0193144935923749e-05,17.993385050985665,6.543393539270542e-06,0.01573250877719321,9.734810742501154e-06,9.83029124181735,-8.163019582927227,bilinear\pitfall_default_stepsize\L1_vanilla_init-uniform_seed0.csv
+bilinear,1,slingshot,uniform,0,2000,194.7058222775547,2.305624445879727e-05,19.47066662631333,1.9176475254744285e-05,0.013864465073886209,0.008550018406616244,9.775424087229338,-9.69515814052613,bilinear\pitfall_default_stepsize\L1_slingshot_init-uniform_seed0.csv

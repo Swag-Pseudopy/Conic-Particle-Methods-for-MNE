@@ -1,0 +1,1318 @@
+--- cell 0 ---
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.animation as animation
+
+# ============================================================
+# Utilities
+# ============================================================
+def wasserstein_distance(u_values, v_values, u_weights=None, v_weights=None):
+    """
+    1-D Wasserstein-2 distance between two weighted empirical distributions.
+    Pure-numpy implementation — no scipy required.
+    """
+    u_values = np.asarray(u_values, dtype=float)
+    v_values = np.asarray(v_values, dtype=float)
+
+    if u_weights is None:
+        u_weights = np.ones_like(u_values) / len(u_values)
+    else:
+        u_weights = np.asarray(u_weights, dtype=float)
+        u_weights /= u_weights.sum()
+
+    if v_weights is None:
+        v_weights = np.ones_like(v_values) / len(v_values)
+    else:
+        v_weights = np.asarray(v_weights, dtype=float)
+        v_weights /= v_weights.sum()
+
+    u_sorter  = np.argsort(u_values)
+    u_values  = u_values[u_sorter];  u_weights = u_weights[u_sorter]
+    v_sorter  = np.argsort(v_values)
+    v_values  = v_values[v_sorter];  v_weights = v_weights[v_sorter]
+
+    u_cdf = np.cumsum(u_weights); u_cdf[-1] = 1.0
+    v_cdf = np.cumsum(v_weights); v_cdf[-1] = 1.0
+
+    cdf_axis  = np.unique(np.concatenate((u_cdf, v_cdf)))
+    cdf_axis  = np.insert(cdf_axis, 0, 0.0)
+    widths    = np.diff(cdf_axis)
+    midpoints = cdf_axis[:-1] + widths / 2
+
+    u_quantiles_idx = np.searchsorted(u_cdf, midpoints)
+    u_quantiles = u_values[0] if len(u_values) == 1 \
+        else u_values[np.clip(u_quantiles_idx, 0, len(u_values) - 1)]
+
+    v_quantiles_idx = np.searchsorted(v_cdf, midpoints)
+    v_quantiles = v_values[0] if len(v_values) == 1 \
+        else v_values[np.clip(v_quantiles_idx, 0, len(v_values) - 1)]
+
+    return float(np.sqrt(np.sum((u_quantiles - v_quantiles)**2 * widths)))
+
+
+# ============================================================
+# 1. Slingshot Stepsize Scheduler
+# ============================================================
+def get_slingshot_steps(problem_type, t, T,
+                        L=None, m=None, M=None,
+                        rng=None, use_slingshot=True):
+    """
+    Returns (alpha_t, beta_t).
+
+    use_slingshot=True  → Shugart's negative-stepsize schedule
+    use_slingshot=False → vanilla constant positive stepsizes (Chizat baseline)
+
+    Bilinear  : Chebyshev schedule on singular-value spectrum [m, M]
+    Nonlinear : randomised symmetry-breaking with h = 1/(3L)
+    """
+    rng = rng or np.random.default_rng()
+
+    if not use_slingshot:
+        h = (1.0 / np.sqrt(M)) if (problem_type == "bilinear" and M is not None) \
+            else 1.0 / (3.0 * L)
+        return h, h
+
+    if problem_type == "bilinear":
+        k   = t // 2
+        r_t = (M + m) / 2 + (M - m) / 2 * np.cos((2 * k + 1) * np.pi / (2 * T))
+        h   = 1.0 / np.sqrt(r_t)
+        return (h, -h) if t % 2 == 0 else (-h, h)
+    else:
+        h = 1.0 / (3.0 * L)
+        if t % 2 == 0:
+            return (h, -h) if rng.random() < 0.5 else (-h, h)
+        else:
+            return h, h
+
+
+# ============================================================
+# 2a. Conic Particle Mirror Prox — stabilised slingshot variant
+# ============================================================
+class ConicParticlesMP:
+    """
+    Stabilised CP-MP with all numerical fixes applied:
+      - log-sum-exp shift on weight updates
+      - pre-update weight preconditioning for positions
+      - adaptive clipping min(1, 0.1/aᵢ)
+      - domain projection to [-10, 10]
+      - correction step always uses |alpha|, |beta|
+    """
+    def __init__(self, n, m, d, rng=None):
+        rng = rng or np.random.default_rng()
+        self.a = np.ones(n) / n
+        self.x = rng.uniform(-3, 3, (n, d))
+        self.b = np.ones(m) / m
+        self.y = rng.uniform(-3, 3, (m, d))
+
+    def _step_weights_only(self, a, b, grad_a, grad_b, alpha, beta):
+        """Mirror-descent weight update with log-sum-exp stabilisation."""
+        log_a  = np.log(np.maximum(a, 1e-15)) - alpha * grad_a
+        log_a -= np.max(log_a)
+        a_new  = np.exp(log_a); a_new /= a_new.sum()
+
+        log_b  = np.log(np.maximum(b, 1e-15)) + beta * grad_b
+        log_b -= np.max(log_b)
+        b_new  = np.exp(log_b); b_new /= b_new.sum()
+        return a_new, b_new
+
+    def _step_positions_only(self, a_ref, x, b_ref, y,
+                              grad_x, grad_y, alpha, beta):
+        """
+        Position step using REFERENCE (pre-update) weights for preconditioning.
+        Adaptive clip: tighter for heavy particles, looser for ghosts.
+        Domain projection enforced after step.
+        """
+        denom_x = np.maximum(a_ref[:, None], 1e-3)
+        step_x  = alpha * grad_x / denom_x
+        clip_x  = np.minimum(1.0, 0.1 / denom_x)
+        x_new   = x - np.clip(step_x, -clip_x, clip_x)
+
+        denom_y = np.maximum(b_ref[:, None], 1e-3)
+        step_y  = beta * grad_y / denom_y
+        clip_y  = np.minimum(1.0, 0.1 / denom_y)
+        y_new   = y + np.clip(step_y, -clip_y, clip_y)
+
+        D = 10.0
+        x_new = np.clip(x_new, -D, D)
+        y_new = np.clip(y_new, -D, D)
+        return x_new, y_new
+
+    def _full_step(self, a, x, b, y,
+                   grad_a, grad_x, grad_b, grad_y, alpha, beta):
+        """Full WFR step: weight update then position update."""
+        a_ref = a.copy(); b_ref = b.copy()
+        a_new, b_new = self._step_weights_only(a, b, grad_a, grad_b, alpha, beta)
+        x_new, y_new = self._step_positions_only(
+            a_ref, x, b_ref, y, grad_x, grad_y, alpha, beta)
+        return a_new, x_new, b_new, y_new
+
+    def update_mp(self, calc_grads_fn, alpha, beta):
+        """
+        Mirror Prox (prediction-correction) update.
+
+        Prediction : full step with slingshot signs (alpha, beta).
+        Correction : full step from ORIGINAL state with |alpha|, |beta|.
+                     The slingshot sign shaped the prediction step;
+                     the correction must always be a genuine improvement.
+        """
+        ga1, gx1, gb1, gy1 = calc_grads_fn(self.a, self.x, self.b, self.y)
+        a_p, x_p, b_p, y_p = self._full_step(
+            self.a, self.x, self.b, self.y,
+            ga1, gx1, gb1, gy1, alpha, beta)
+
+        ga2, gx2, gb2, gy2 = calc_grads_fn(a_p, x_p, b_p, y_p)
+
+        self.a, self.x, self.b, self.y = self._full_step(
+            self.a, self.x, self.b, self.y,
+            ga2, gx2, gb2, gy2,
+            abs(alpha), abs(beta)           # KEY: correction always positive
+        )
+
+
+# ============================================================
+# 2b. Vanilla Chizat Baseline — raw paper equations, no stabilisation
+# ============================================================
+class ConicParticlesMPChizat:
+    """
+    Faithful implementation of Chizat's CP-MP as written in the paper.
+
+    Differences from ConicParticlesMP (the stabilised version):
+      - Weight update: plain exp/normalise — NO log-sum-exp shift.
+      - Position update: divided by aᵢ directly — NO floor on denominator,
+        NO adaptive clip, NO uniform clip.
+      - NO domain projection.
+      - Correction step uses raw (alpha, beta) — no |·| forcing.
+
+    Uses np.nan as the zero-weight sentinel so blown-up ghost particles
+    surface visibly in the diagnostics rather than producing silent garbage.
+
+    This class exists solely as a truthful baseline. Do not use as production solver.
+    """
+    def __init__(self, n, m, d, rng=None):
+        rng = rng or np.random.default_rng()
+        self.a = np.ones(n) / n
+        self.x = rng.uniform(-3, 3, (n, d))
+        self.b = np.ones(m) / m
+        self.y = rng.uniform(-3, 3, (m, d))
+
+    def _step_weights_only(self, a, b, grad_a, grad_b, alpha, beta):
+        """Raw multiplicative weight update — no log-sum-exp shift."""
+        a_new = np.maximum(a * np.exp(-alpha * grad_a), 0.0)
+        s = a_new.sum(); a_new = a_new / s if s > 0 else a_new
+
+        b_new = np.maximum(b * np.exp(beta * grad_b), 0.0)
+        s = b_new.sum(); b_new = b_new / s if s > 0 else b_new
+        return a_new, b_new
+
+    def _step_positions_only(self, a_ref, x, b_ref, y,
+                              grad_x, grad_y, alpha, beta):
+        """Raw preconditioned position update — no clipping, no projection."""
+        safe_a = np.where(a_ref > 0, a_ref, np.nan)
+        safe_b = np.where(b_ref > 0, b_ref, np.nan)
+        x_new  = x - alpha * grad_x / safe_a[:, None]
+        y_new  = y + beta  * grad_y / safe_b[:, None]
+        return x_new, y_new
+
+    def _full_step(self, a, x, b, y,
+                   grad_a, grad_x, grad_b, grad_y, alpha, beta):
+        a_ref = a.copy(); b_ref = b.copy()
+        a_new, b_new = self._step_weights_only(a, b, grad_a, grad_b, alpha, beta)
+        x_new, y_new = self._step_positions_only(
+            a_ref, x, b_ref, y, grad_x, grad_y, alpha, beta)
+        return a_new, x_new, b_new, y_new
+
+    def update_mp(self, calc_grads_fn, alpha, beta):
+        """
+        Raw Mirror Prox — both prediction and correction use literal
+        (alpha, beta) including any negative slingshot signs.
+        """
+        ga1, gx1, gb1, gy1 = calc_grads_fn(self.a, self.x, self.b, self.y)
+        a_p, x_p, b_p, y_p = self._full_step(
+            self.a, self.x, self.b, self.y,
+            ga1, gx1, gb1, gy1, alpha, beta)
+
+        ga2, gx2, gb2, gy2 = calc_grads_fn(a_p, x_p, b_p, y_p)
+
+        self.a, self.x, self.b, self.y = self._full_step(
+            self.a, self.x, self.b, self.y,
+            ga2, gx2, gb2, gy2, alpha, beta   # raw signs, no |·|
+        )
+
+
+# ============================================================
+# 3. Objective Functions & Gradients
+# ============================================================
+def f_bilinear(x, y, B):    return (x @ B @ y).item()
+def grad_bilinear(x, y, B): return B @ y, B.T @ x
+
+def logcosh(x):
+    s = np.sign(x) * x
+    return s + np.log1p(np.exp(-2 * s)) - np.log(2.0)
+
+def f_convex_concave(x, y):    return (logcosh(x) - logcosh(y)).item()
+def grad_convex_concave(x, y): return np.tanh(x), -np.tanh(y)
+
+def f_sc_sc(x, y, mu=1.0):
+    return (0.5*mu*np.sum(x**2) - 0.5*mu*np.sum(y**2) + np.sum(x*y)).item()
+def grad_sc_sc(x, y, mu=1.0): return mu*x + y, -mu*y + x
+
+
+# ============================================================
+# 4. Diagnostic Helpers
+# ============================================================
+def get_weighted_barycenter(weights, positions):
+    """Expected strategy: Σ aᵢ xᵢ."""
+    return np.sum(weights[:, None] * positions, axis=0)
+
+def entropy(weights):
+    """Shannon entropy H(a) = -Σ aᵢ log aᵢ. Zero iff Dirac delta."""
+    w = np.maximum(weights, 1e-15)
+    return float(-np.sum(w * np.log(w)))
+
+def duality_gap(a, x, b, y, f_func):
+    """
+    Exploitability / duality gap:
+      gap = max_j Σᵢ aᵢ f(xᵢ,yⱼ)  −  min_i Σⱼ bⱼ f(xᵢ,yⱼ)  ≥ 0
+    Equals zero iff (μ,ν) is an MNE.
+    """
+    vals = np.array([[f_func(x[i], y[j])
+                      for j in range(len(y))] for i in range(len(x))])
+    return float(np.max(vals.T @ a) - np.min(vals @ b))
+
+def wasserstein_to_mne(weights, positions, mne_pos=0.0):
+    """W₂ distance between particle measure Σ aᵢ δ_{xᵢ} and target δ_{mne_pos}."""
+    return wasserstein_distance(
+        positions[:, 0], np.array([mne_pos]),
+        u_weights=weights, v_weights=np.array([1.0])
+    )
+
+def compute_regret(gap_history):
+    """
+    Cumulative average regret: R_T = (1/T) Σ_{t=1}^{T} gap_t.
+    Forward-fills NaN entries (gap computed every 10 steps).
+    """
+    gaps = np.array(gap_history, dtype=float)
+    for i in range(1, len(gaps)):
+        if np.isnan(gaps[i]):
+            gaps[i] = gaps[i-1]
+    return np.cumsum(gaps) / (np.arange(len(gaps)) + 1)
+
+def f_mixture(a, x, b, y, f_func):
+    """F(μ_t, ν_t) — value of the objective at the current iterate."""
+    return sum(
+        a[i] * b[j] * f_func(x[i], y[j])
+        for i in range(len(x)) for j in range(len(y))
+    )
+
+
+# ============================================================
+# 5. Experiment Runner
+# ============================================================
+def run_experiment_mp(model, grad_func, f_func, steps=200,
+                      problem_type="bilinear", T=None,
+                      L=None, m=None, M=None,
+                      rng=None, use_slingshot=True,
+                      w2_threshold=None):
+    """
+    Runs CP-MP and records full diagnostic history.
+
+    Parameters
+    ----------
+    model : ConicParticlesMP | ConicParticlesMPChizat
+        Pass ConicParticlesMP        for the stabilised slingshot variant.
+        Pass ConicParticlesMPChizat  for the raw Chizat baseline.
+    use_slingshot : bool
+        True  → Shugart's negative-stepsize schedule.
+        False → constant positive stepsize h for both players.
+        For the Chizat baseline, always pass use_slingshot=False.
+    w2_threshold : float or None
+        If set, stop early when W₂ for either player falls below this value.
+
+    Returns
+    -------
+    history : dict with keys
+        a, x, b, y        — particle states at each step
+        barycenter         — weighted mean (x̄_t, ȳ_t)
+        entropy_a/b        — H(a_t), H(b_t)
+        hamiltonian        — ½‖∇f(x̄,ȳ)‖²
+        gap                — duality gap (every 10 steps, else NaN)
+        f_val              — F(μ_t, ν_t)
+        w2_a / w2_b        — W₂(μ_t, δ₀) / W₂(ν_t, δ₀)
+        regret             — cumulative average regret
+    """
+    rng = rng or np.random.default_rng()
+    T   = T or steps
+
+    history = {
+        'a': [], 'x': [], 'b': [], 'y': [],
+        'barycenter'  : [],
+        'entropy_a'   : [], 'entropy_b'   : [],
+        'hamiltonian' : [],
+        'gap'         : [],
+        'f_val'       : [],
+        'w2_a'        : [], 'w2_b'        : [],
+    }
+
+    for t in range(steps):
+        # ---- Record state ----
+        history['a'].append(model.a.copy())
+        history['x'].append(model.x.copy())
+        history['b'].append(model.b.copy())
+        history['y'].append(model.y.copy())
+
+        xb = get_weighted_barycenter(model.a, model.x)[0]
+        yb = get_weighted_barycenter(model.b, model.y)[0]
+        history['barycenter'].append((xb, yb))
+
+        history['entropy_a'].append(entropy(model.a))
+        history['entropy_b'].append(entropy(model.b))
+
+        gx0, gy0 = grad_func(np.array([xb]), np.array([yb]))
+        history['hamiltonian'].append(
+            0.5 * (float(np.sum(gx0**2)) + float(np.sum(gy0**2))))
+
+        history['f_val'].append(
+            f_mixture(model.a, model.x, model.b, model.y, f_func))
+
+        # W₂ + optional early stopping
+        w2a = wasserstein_to_mne(model.a, model.x)
+        w2b = wasserstein_to_mne(model.b, model.y)
+        history['w2_a'].append(w2a)
+        history['w2_b'].append(w2b)
+
+        if w2_threshold is not None and (w2a < w2_threshold or w2b < w2_threshold):
+            print(f"  Early stop at step {t}: W₂ below {w2_threshold}.")
+            history['gap'].append(
+                duality_gap(model.a, model.x, model.b, model.y, f_func))
+            break
+
+        # Duality gap every 10 steps (O(n²))
+        if t % 10 == 0:
+            history['gap'].append(
+                duality_gap(model.a, model.x, model.b, model.y, f_func))
+        else:
+            history['gap'].append(np.nan)
+
+        # ---- Compute gradients and step ----
+        alpha, beta = get_slingshot_steps(
+            problem_type, t, T, L=L, m=m, M=M,
+            rng=rng, use_slingshot=use_slingshot)
+
+        def compute_grads(a_s, x_s, b_s, y_s):
+            n_, m_ = len(x_s), len(y_s)
+            gx_t = np.zeros_like(x_s); gy_t = np.zeros_like(y_s)
+            ga_t = np.zeros(n_);        gb_t = np.zeros(m_)
+            for i in range(n_):
+                for j in range(m_):
+                    gx, gy = grad_func(x_s[i], y_s[j])
+                    val    = f_func(x_s[i], y_s[j])
+                    gx_t[i] += b_s[j] * gx.item()
+                    gy_t[j] += a_s[i] * gy.item()
+                    ga_t[i] += b_s[j] * val
+                    gb_t[j] += a_s[i] * val
+            return ga_t, gx_t, gb_t, gy_t
+
+        model.update_mp(compute_grads, alpha, beta)
+
+    history['regret'] = list(compute_regret(history['f_val']))
+    return history
+
+
+# ============================================================
+# 6. Dashboard — 3×3 grid, static, notebook-viewable + saveable
+# ============================================================
+def plot_dashboard(history, grad_func, title="", save_path=None):
+    """
+    3×3 grid:
+      [0,0] Hamiltonian landscape + barycenter + final particles
+      [0,1] Barycenter distance to origin (log)
+      [0,2] F(μ_t, ν_t) — value at iterate
+      [1,0] Strategy entropy H(a), H(b)
+      [1,1] Duality gap (log)
+      [1,2] Cumulative average regret (log)
+      [2,0] Final P1 strategy mass histogram
+      [2,1] Final P2 strategy mass histogram
+      [2,2] Wasserstein W₂ to MNE (log)
+    """
+    fig = plt.figure(figsize=(18, 13))
+    fig.suptitle(title, fontsize=14, fontweight='bold', y=1.01)
+    gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.48, wspace=0.35)
+    axs = [[fig.add_subplot(gs[r, c]) for c in range(3)] for r in range(3)]
+
+    # ---- [0,0] Landscape ----
+    xs = np.linspace(-3, 3, 80)
+    X, Y = np.meshgrid(xs, xs)
+    Z = np.zeros_like(X)
+    for i in range(X.shape[0]):
+        for j in range(X.shape[1]):
+            gx, gy = grad_func(np.array([X[i, j]]), np.array([Y[i, j]]))
+            Z[i, j] = 0.5 * (gx.item()**2 + gy.item()**2)
+    axs[0][0].contourf(X, Y, Z, levels=30, cmap='Blues', alpha=0.5)
+
+    traj = np.array(history['barycenter'])
+    mask = ~np.isnan(traj).any(axis=1)
+    tc   = traj[mask]
+    if len(tc):
+        axs[0][0].plot(tc[:, 0], tc[:, 1], 'k-', lw=1.5, label='Barycenter', zorder=3)
+        axs[0][0].scatter(*tc[0],  c='white',  edgecolors='k', s=80,  zorder=4, label='Start')
+        axs[0][0].scatter(*tc[-1], c='yellow', edgecolors='k', s=280,
+                           marker='*', zorder=5, label='End')
+
+    a_f, x_f = history['a'][-1], history['x'][-1]
+    b_f, y_f = history['b'][-1], history['y'][-1]
+
+    vp1 = ~np.isnan(x_f[:, 0])
+    vp2 = ~np.isnan(y_f[:, 0])
+    if vp1.any():
+        axs[0][0].scatter(x_f[vp1, 0], np.full(vp1.sum(), -0.1),
+                          s=np.maximum(a_f[vp1] * 2000, 5), c='red',
+                          alpha=0.8, edgecolors='k', zorder=5, label='P1')
+    if vp2.any():
+        axs[0][0].scatter(np.full(vp2.sum(), 0.1), y_f[vp2, 0],
+                          s=np.maximum(b_f[vp2] * 2000, 5), c='orange',
+                          alpha=0.8, edgecolors='k', zorder=5, label='P2')
+    axs[0][0].set_xlim(-3, 3); axs[0][0].set_ylim(-3, 3)
+    axs[0][0].set_title("Hamiltonian + Particles", fontsize=10)
+    axs[0][0].legend(fontsize=6, loc='upper right')
+
+    # ---- [0,1] Log barycenter distance ----
+    if len(tc):
+        dist = np.sqrt(tc[:, 0]**2 + tc[:, 1]**2)
+        axs[0][1].semilogy(dist, c='purple', lw=1.8)
+    axs[0][1].set_title("Barycenter Distance (log)", fontsize=10)
+    axs[0][1].set_xlabel("Iteration"); axs[0][1].set_ylabel("‖bary‖")
+    axs[0][1].grid(True, ls='--', alpha=0.5)
+
+    # ---- [0,2] F(μ_t, ν_t) ----
+    fvals = np.array(history['f_val'])
+    axs[0][2].plot(fvals, c='steelblue', lw=1.8)
+    axs[0][2].axhline(0, color='k', ls='--', lw=1, label='MNE value = 0')
+    axs[0][2].set_title("F(μ_t, ν_t) — iterate value", fontsize=10)
+    axs[0][2].set_xlabel("Iteration"); axs[0][2].set_ylabel("F")
+    axs[0][2].legend(fontsize=7); axs[0][2].grid(True, ls='--', alpha=0.5)
+
+    # ---- [1,0] Entropy ----
+    ea = np.array(history['entropy_a'])
+    eb = np.array(history['entropy_b'])
+    axs[1][0].plot(ea, c='red',    lw=1.8, label='H(a) — P1')
+    axs[1][0].plot(eb, c='orange', lw=1.8, label='H(b) — P2')
+    axs[1][0].axhline(0, color='k', ls='--', lw=1, label='Target 0')
+    axs[1][0].set_title("Strategy Entropy  (↓ = mass collapse)", fontsize=10)
+    axs[1][0].set_xlabel("Iteration"); axs[1][0].set_ylabel("H")
+    axs[1][0].legend(fontsize=7); axs[1][0].grid(True, ls='--', alpha=0.5)
+
+    # ---- [1,1] Duality gap ----
+    gap = np.array(history['gap'])
+    vi  = ~np.isnan(gap)
+    if vi.any():
+        axs[1][1].semilogy(np.where(vi)[0], gap[vi], 'g-o', lw=1.8, ms=3, label='Gap')
+    axs[1][1].axhline(1e-2, color='red', ls='--', lw=1, label='ε=0.01')
+    axs[1][1].set_title("Duality Gap  (↓ = Nash)", fontsize=10)
+    axs[1][1].set_xlabel("Iteration"); axs[1][1].set_ylabel("Gap (log)")
+    axs[1][1].legend(fontsize=7); axs[1][1].grid(True, ls='--', alpha=0.5)
+
+    # ---- [1,2] Regret ----
+    regret = np.array(history['regret'])
+    axs[1][2].semilogy(regret, c='brown', lw=1.8)
+    axs[1][2].set_title("Cumulative Avg Regret  (↓ = no-regret)", fontsize=10)
+    axs[1][2].set_xlabel("Iteration"); axs[1][2].set_ylabel("R_T (log)")
+    axs[1][2].grid(True, ls='--', alpha=0.5)
+
+    # ---- [2,0] Final P1 histogram ----
+    if vp1.any():
+        axs[2][0].bar(x_f[vp1, 0], a_f[vp1], width=0.12,
+                      color='red', alpha=0.8, edgecolor='k')
+    axs[2][0].axvline(0, color='k', ls='--', lw=1, label='x*=0')
+    axs[2][0].set_xlim(-3, 3); axs[2][0].set_ylim(0, 1.05)
+    axs[2][0].set_title("Final P1 Strategy Mass", fontsize=10)
+    axs[2][0].set_xlabel("x"); axs[2][0].set_ylabel("aᵢ")
+    axs[2][0].legend(fontsize=7)
+
+    # ---- [2,1] Final P2 histogram ----
+    if vp2.any():
+        axs[2][1].bar(y_f[vp2, 0], b_f[vp2], width=0.12,
+                      color='orange', alpha=0.8, edgecolor='k')
+    axs[2][1].axvline(0, color='k', ls='--', lw=1, label='y*=0')
+    axs[2][1].set_xlim(-3, 3); axs[2][1].set_ylim(0, 1.05)
+    axs[2][1].set_title("Final P2 Strategy Mass", fontsize=10)
+    axs[2][1].set_xlabel("y"); axs[2][1].set_ylabel("bⱼ")
+    axs[2][1].legend(fontsize=7)
+
+    # ---- [2,2] Wasserstein to MNE ----
+    w2a = np.array(history['w2_a'])
+    w2b = np.array(history['w2_b'])
+    axs[2][2].semilogy(w2a, c='red',    lw=1.8, label='W₂(μ_t, δ₀)')
+    axs[2][2].semilogy(w2b, c='orange', lw=1.8, label='W₂(ν_t, δ₀)')
+    axs[2][2].set_title("Wasserstein Dist to MNE  (↓ = converged)", fontsize=10)
+    axs[2][2].set_xlabel("Iteration"); axs[2][2].set_ylabel("W₂ (log)")
+    axs[2][2].legend(fontsize=7); axs[2][2].grid(True, ls='--', alpha=0.5)
+
+    if save_path:
+        fig.savefig(save_path, dpi=110, bbox_inches='tight')
+        print(f"  Saved → {save_path}")
+    return fig
+
+
+# ============================================================
+# 7. GIF Generator — separated for notebook use
+# ============================================================
+def animate_convergence(history, grad_func, filename="convergence.gif", title=""):
+    """
+    4-panel animated GIF:
+      [0] Hamiltonian landscape + particles + barycenter path
+      [1] P1 probability mass histogram (entropy shown in title)
+      [2] P2 probability mass histogram (entropy shown in title)
+      [3] Entropy (left axis, solid) + W₂ (right axis, dashed, log)
+    """
+    fig, axs = plt.subplots(1, 4, figsize=(20, 5))
+    fig.suptitle(title, fontsize=11, fontweight='bold')
+
+    xs = np.linspace(-3, 3, 80)
+    X, Y = np.meshgrid(xs, xs)
+    Z = np.zeros_like(X)
+    for i in range(X.shape[0]):
+        for j in range(X.shape[1]):
+            gx, gy = grad_func(np.array([X[i, j]]), np.array([Y[i, j]]))
+            Z[i, j] = 0.5 * (gx.item()**2 + gy.item()**2)
+    axs[0].contourf(X, Y, Z, levels=30, cmap='Blues', alpha=0.4)
+
+    scat_p1   = axs[0].scatter([], [], c='red',    edgecolors='k', zorder=5)
+    scat_p2   = axs[0].scatter([], [], c='orange', edgecolors='k', zorder=4)
+    line_bary, = axs[0].plot([], [], 'k-', lw=1.5, zorder=2)
+    scat_bary  = axs[0].scatter([], [], c='yellow', edgecolors='k',
+                                 marker='*', s=250, zorder=10)
+    axs[0].set_xlim(-3, 3); axs[0].set_ylim(-3, 3)
+    axs[0].set_title("State Space", fontsize=9)
+
+    steps_range = np.arange(len(history['a']))
+    ea  = np.array(history['entropy_a'])
+    eb  = np.array(history['entropy_b'])
+    w2a = np.array(history['w2_a'])
+    w2b = np.array(history['w2_b'])
+    ax3b = axs[3].twinx()
+
+    def update(frame):
+        a, x = history['a'][frame], history['x'][frame]
+        b, y = history['b'][frame], history['y'][frame]
+
+        vp1 = ~np.isnan(x[:, 0]); vp2 = ~np.isnan(y[:, 0])
+
+        if vp1.any():
+            scat_p1.set_offsets(np.c_[x[vp1, 0], np.full(vp1.sum(), -0.05)])
+            scat_p1.set_sizes(np.maximum(a[vp1] * 1500, 5))
+        else:
+            scat_p1.set_offsets(np.empty((0, 2))); scat_p1.set_sizes([])
+
+        if vp2.any():
+            scat_p2.set_offsets(np.c_[np.full(vp2.sum(), 0.05), y[vp2, 0]])
+            scat_p2.set_sizes(np.maximum(b[vp2] * 1500, 5))
+        else:
+            scat_p2.set_offsets(np.empty((0, 2))); scat_p2.set_sizes([])
+
+        bp = np.array(history['barycenter'][:frame+1])
+        line_bary.set_data(bp[:, 0], bp[:, 1])
+        scat_bary.set_offsets([bp[-1]])
+
+        axs[1].clear()
+        axs[1].set_xlim(-3, 3); axs[1].set_ylim(0, 1.05)
+        axs[1].set_title(f"P1 Mass   H={ea[frame]:.3f}", fontsize=8)
+        if vp1.any():
+            axs[1].bar(x[vp1, 0], a[vp1], width=0.13,
+                       color='red', alpha=0.75, edgecolor='k')
+        axs[1].axvline(0, color='k', ls='--', lw=0.8)
+        axs[1].set_xlabel("x", fontsize=7); axs[1].set_ylabel("aᵢ", fontsize=7)
+
+        axs[2].clear()
+        axs[2].set_xlim(-3, 3); axs[2].set_ylim(0, 1.05)
+        axs[2].set_title(f"P2 Mass   H={eb[frame]:.3f}", fontsize=8)
+        if vp2.any():
+            axs[2].bar(y[vp2, 0], b[vp2], width=0.13,
+                       color='orange', alpha=0.75, edgecolor='k')
+        axs[2].axvline(0, color='k', ls='--', lw=0.8)
+        axs[2].set_xlabel("y", fontsize=7)
+
+        sr = steps_range[:frame+1]
+        axs[3].clear(); ax3b.clear()
+        axs[3].plot(sr, ea[:frame+1], 'r-',          lw=1.4, label='H(a)')
+        axs[3].plot(sr, eb[:frame+1], color='orange', lw=1.4, label='H(b)')
+        ax3b.semilogy(sr, w2a[:frame+1], 'r--',          lw=1.0, alpha=0.65, label='W₂(μ)')
+        ax3b.semilogy(sr, w2b[:frame+1], color='orange', lw=1.0, ls='--',
+                      alpha=0.65, label='W₂(ν)')
+        axs[3].set_xlim(0, len(history['a']))
+        axs[3].set_ylim(-0.05, np.log(len(a)) + 0.3)
+        axs[3].set_title("H (solid) / W₂ (dashed)", fontsize=8)
+        axs[3].set_xlabel("t", fontsize=7); axs[3].set_ylabel("H", fontsize=7)
+        ax3b.set_ylabel("W₂ (log)", fontsize=7)
+        axs[3].legend(fontsize=6, loc='upper left')
+        ax3b.legend(fontsize=6, loc='upper right')
+        axs[3].grid(True, ls='--', alpha=0.35)
+
+    print(f"  Generating {filename}  ({len(history['a'])} frames) ...")
+    ani = animation.FuncAnimation(fig, update, frames=len(history['a']), interval=80)
+    ani.save(filename, writer='pillow')
+    plt.close(fig)
+    print("  Done!")
+
+
+# ============================================================
+# 8. Cross-Method Comparison Plots
+# ============================================================
+def _safe(arr):
+    """
+    Replace NaN, Inf, and non-positive values with NaN.
+    Non-positive values are masked because semilogy silently drops them,
+    making lines (especially Chizat raw) disappear without warning when
+    they shoot far out of the visible range.
+    """
+    a = np.array(arr, dtype=float)
+    a[~np.isfinite(a)] = np.nan
+    a[a <= 0] = np.nan          # semilogy requires strictly positive values
+    return a
+
+METHODS = [
+    dict(key_prefix="sl",  label="Slingshot",     color="#e63946", ls="-",  lw=2.0),
+    dict(key_prefix="off", label="CP-MP (no SL)", color="#2a9d8f", ls="--", lw=1.8),
+    # Purple replaces yellow — high contrast on white, visible at all zoom levels
+    dict(key_prefix="van", label="Chizat (raw)",  color="#6a0dad", ls=":",  lw=1.8),
+]
+
+def plot_comparison(histories, cases, methods=METHODS,
+                    save_prefix="cpmp_compare",
+                    ylims=None):
+    """
+    For each game in `cases`, produce two figures:
+      {save_prefix}_{name}_P1.png  and  {save_prefix}_{name}_P2.png
+
+    Each figure — 2×3 grid, all six metrics:
+      [0,0] Barycenter dist to origin (log)  — shared
+      [0,1] F(μ_t, ν_t)              (linear) — shared
+      [0,2] Duality gap              (log)    — shared
+      [1,0] Entropy H(a) or H(b)    (linear)  — player-specific
+      [1,1] Cumulative avg regret   (log)    — shared
+      [1,2] W₂(μ_t,δ₀) or W₂(ν_t,δ₀)(log)  — player-specific
+
+    Parameters
+    ----------
+    ylims : dict, optional
+        Keys: 'bary', 'f', 'gap', 'ent', 'reg', 'w2'
+        Values: (ymin, ymax) tuples applied only to the specified axes.
+        Example:
+            ylims = {'bary': (1e-4, 10), 'gap': (1e-3, 5), 'w2': (1e-3, 3)}
+    """
+    ylims = ylims or {}
+
+    for c in cases:
+        for player, plabel in [("a", "P1"), ("b", "P2")]:
+
+            fig = plt.figure(figsize=(18, 10))
+            fig.suptitle(
+                f"{c['label']} — {plabel}:  all methods compared",
+                fontsize=13, fontweight='bold', y=1.01
+            )
+            gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.42, wspace=0.33)
+
+            ax_bary = fig.add_subplot(gs[0, 0])
+            ax_f    = fig.add_subplot(gs[0, 1])
+            ax_gap  = fig.add_subplot(gs[0, 2])
+            ax_ent  = fig.add_subplot(gs[1, 0])
+            ax_reg  = fig.add_subplot(gs[1, 1])
+            ax_w2   = fig.add_subplot(gs[1, 2])
+
+            any_plotted = False
+
+            for m in methods:
+                key = f"{m['key_prefix']}_{c['name']}"
+                if key not in histories:
+                    continue
+                h, _ = histories[key]
+                any_plotted = True
+
+                T     = len(h['a'])
+                iters = np.arange(T)
+                kw    = dict(color=m['color'], ls=m['ls'],
+                             lw=m['lw'], label=m['label'])
+
+                # [0,0] Barycenter distance
+                traj = np.array(h['barycenter'])
+                mask = ~np.isnan(traj).any(axis=1)
+                tc   = traj[mask]
+                if len(tc):
+                    dist = _safe(np.sqrt(tc[:, 0]**2 + tc[:, 1]**2))
+                    ax_bary.semilogy(np.where(mask)[0][:len(dist)], dist, **kw)
+
+                # [0,1] F(μ_t, ν_t)
+                ax_f.plot(iters[:T], _safe(h['f_val']), **kw)
+
+                # [0,2] Duality gap
+                gap = _safe(h['gap'])
+                vi  = np.isfinite(gap)
+                if vi.any():
+                    ax_gap.semilogy(iters[:T][vi], gap[vi], **kw)
+
+                # [1,0] Entropy — player-specific
+                ax_ent.plot(iters[:T], _safe(h[f'entropy_{player}']), **kw)
+
+                # [1,1] Regret
+                ax_reg.semilogy(iters[:T], _safe(h['regret']), **kw)
+
+                # [1,2] W₂ — player-specific
+                ax_w2.semilogy(iters[:T], _safe(h[f'w2_{player}']), **kw)
+
+            if not any_plotted:
+                plt.close(fig)
+                print(f"  Skipping {c['label']} {plabel} — no histories found.")
+                continue
+
+            # Autoscale all log axes BEFORE applying any manual ylims so that
+            # the Chizat raw line (which can be orders of magnitude larger than
+            # the slingshot lines) is always included in the visible range.
+            for ax in (ax_bary, ax_gap, ax_reg, ax_w2, ax_ent, ax_f):
+                ax.autoscale(enable=True, axis='y')
+
+            # ---- Formatting ----
+            ax_bary.set_title("Barycenter Dist to MNE  (log)", fontsize=10)
+            ax_bary.set_xlabel("Iteration"); ax_bary.set_ylabel("‖bary‖ (log)")
+            ax_bary.legend(fontsize=7); ax_bary.grid(True, ls='--', alpha=0.45)
+
+            ax_f.set_title("F(μ_t, ν_t) — iterate value", fontsize=10)
+            ax_f.set_xlabel("Iteration"); ax_f.set_ylabel("F")
+            ax_f.axhline(0, color='k', ls='--', lw=0.8, label='MNE = 0')
+            ax_f.legend(fontsize=7); ax_f.grid(True, ls='--', alpha=0.45)
+
+            ax_gap.set_title("Duality Gap  (log, ↓ = Nash)", fontsize=10)
+            ax_gap.set_xlabel("Iteration"); ax_gap.set_ylabel("Gap (log)")
+            ax_gap.axhline(1e-2, color='k', ls='--', lw=0.8, label='ε=0.01')
+            ax_gap.legend(fontsize=7); ax_gap.grid(True, ls='--', alpha=0.45)
+
+            ax_ent.set_title(f"Entropy H  [{plabel}]  (↓ = mass collapse)", fontsize=10)
+            ax_ent.set_xlabel("Iteration"); ax_ent.set_ylabel("H")
+            ax_ent.axhline(0, color='k', ls='--', lw=0.8, label='Target 0')
+            ax_ent.legend(fontsize=7); ax_ent.grid(True, ls='--', alpha=0.45)
+
+            ax_reg.set_title("Cumulative Avg Regret  (log, ↓ = no-regret)", fontsize=10)
+            ax_reg.set_xlabel("Iteration"); ax_reg.set_ylabel("R_T (log)")
+            ax_reg.legend(fontsize=7); ax_reg.grid(True, ls='--', alpha=0.45)
+
+            ax_w2.set_title(f"W₂(ν_t, δ₀)  [{plabel}]  (log, ↓ = converged)", fontsize=10)
+            ax_w2.set_xlabel("Iteration"); ax_w2.set_ylabel("W₂ (log)")
+            ax_w2.legend(fontsize=7); ax_w2.grid(True, ls='--', alpha=0.45)
+
+            # ---- Optional ylim overrides ----
+            if 'bary' in ylims: ax_bary.set_ylim(ylims['bary'])
+            if 'f'    in ylims: ax_f.set_ylim(ylims['f'])
+            if 'gap'  in ylims: ax_gap.set_ylim(ylims['gap'])
+            if 'ent'  in ylims: ax_ent.set_ylim(ylims['ent'])
+            if 'reg'  in ylims: ax_reg.set_ylim(ylims['reg'])
+            if 'w2'   in ylims: ax_w2.set_ylim(ylims['w2'])
+
+            plt.tight_layout()
+
+            save_path = f"{save_prefix}_{c['name']}_{plabel}.png"
+            fig.savefig(save_path, dpi=120, bbox_inches='tight')
+            print(f"  Saved → {save_path}")
+            plt.show()
+            plt.close(fig)
+
+
+# ============================================================
+# 9. Driver — structured as 7 notebook cells
+# ============================================================
+if __name__ == "__main__":
+
+    rng = np.random.default_rng(42)
+
+    B_mat  = np.array([[1.0]])
+    N_PART = 30
+    D      = 1
+
+    CASES = [
+        dict(name="bilinear",
+             label="Bilinear",
+             grad=lambda x, y: grad_bilinear(x, y, B_mat),
+             f   =lambda x, y: f_bilinear(x, y, B_mat),
+             ptype="bilinear",  steps_sl=1000, steps_van=1000,
+             L=None, m=1.0, M=1.0),
+        dict(name="convex_concave",
+             label="Convex-Concave",
+             grad=grad_convex_concave,
+             f   =f_convex_concave,
+             ptype="nonlinear", steps_sl=1000, steps_van=1000,
+             L=1.0, m=None, M=None),
+        dict(name="scsc",
+             label="SC-SC",
+             grad=lambda x, y: grad_sc_sc(x, y, mu=1.0),
+             f   =lambda x, y: f_sc_sc(x, y, mu=1.0),
+             ptype="nonlinear", steps_sl=1000, steps_van=1000,
+             L=float(np.sqrt(2)), m=None, M=None),
+    ]
+
+    histories = {}
+
+    # ----------------------------------------------------------
+    # CELL 1 — Dashboards: Slingshot ON
+    # ----------------------------------------------------------
+    print("=" * 55)
+    print("CELL 1 — Dashboards  (Slingshot ON)")
+    print("=" * 55)
+    for c in CASES:
+        print(f"\n  {c['label']}  (slingshot, {c['steps_sl']} steps)")
+        model = ConicParticlesMP(n=N_PART, m=N_PART, d=D, rng=rng)
+        h = run_experiment_mp(
+            model, c['grad'], c['f'],
+            steps=c['steps_sl'], problem_type=c['ptype'],
+            L=c['L'], m=c['m'], M=c['M'],
+            rng=rng, use_slingshot=True, w2_threshold=0.0
+        )
+        histories[f"sl_{c['name']}"] = (h, c['grad'])
+        fig = plot_dashboard(h, c['grad'],
+                             title=f"{c['label']} — CP-MP  (Slingshot)",
+                             save_path=f"cpmp_{c['name']}_dashboard.png")
+        plt.show(); plt.close(fig)
+
+    # ----------------------------------------------------------
+    # CELL 2 — Dashboards: Slingshot OFF
+    # ----------------------------------------------------------
+    print("\n" + "=" * 55)
+    print("CELL 2 — Dashboards  (Slingshot OFF)")
+    print("=" * 55)
+    for c in CASES:
+        print(f"\n  {c['label']}  (no slingshot, {c['steps_sl']} steps)")
+        model = ConicParticlesMP(n=N_PART, m=N_PART, d=D, rng=rng)
+        h = run_experiment_mp(
+            model, c['grad'], c['f'],
+            steps=c['steps_sl'], problem_type=c['ptype'],
+            L=c['L'], m=c['m'], M=c['M'],
+            rng=rng, use_slingshot=False, w2_threshold=0.0
+        )
+        histories[f"off_{c['name']}"] = (h, c['grad'])
+        fig = plot_dashboard(h, c['grad'],
+                             title=f"{c['label']} — CP-MP  (w/o Slingshot)",
+                             save_path=f"cpmp_{c['name']}_w_o_slingshot_dashboard.png")
+        plt.show(); plt.close(fig)
+
+    # ----------------------------------------------------------
+    # CELL 3 — Dashboards: Vanilla Chizat
+    # ----------------------------------------------------------
+    print("\n" + "=" * 55)
+    print("CELL 3 — Dashboards  (Vanilla Chizat, raw paper equations)")
+    print("=" * 55)
+    for c in CASES:
+        print(f"\n  {c['label']}  (Chizat baseline, {c['steps_van']} steps)")
+        model = ConicParticlesMPChizat(n=N_PART, m=N_PART, d=D, rng=rng)
+        h = run_experiment_mp(
+            model, c['grad'], c['f'],
+            steps=c['steps_van'], problem_type=c['ptype'],
+            L=c['L'], m=c['m'], M=c['M'],
+            rng=rng, use_slingshot=False, w2_threshold=0.0
+        )
+        histories[f"van_{c['name']}"] = (h, c['grad'])
+        fig = plot_dashboard(h, c['grad'],
+                             title=f"{c['label']} — CP-MP  (Vanilla Chizat, raw)",
+                             save_path=f"cpmp_{c['name']}_chizat_dashboard.png")
+        plt.show(); plt.close(fig)
+
+    # # ----------------------------------------------------------
+    # # CELL 4 — GIFs: Slingshot ON
+    # # ----------------------------------------------------------
+    # print("\n" + "=" * 55)
+    # print("CELL 4 — GIFs  (Slingshot ON)")
+    # print("=" * 55)
+    # for c in CASES:
+    #     if f"sl_{c['name']}" in histories:
+    #         h, gf = histories[f"sl_{c['name']}"]
+    #         animate_convergence(h, gf, filename=f"cpmp_{c['name']}.gif",
+    #                             title=f"{c['label']}  CP-MP (Slingshot)")
+
+    # # ----------------------------------------------------------
+    # # CELL 5 — GIFs: Slingshot OFF
+    # # ----------------------------------------------------------
+    # print("\n" + "=" * 55)
+    # print("CELL 5 — GIFs  (Slingshot OFF)")
+    # print("=" * 55)
+    # for c in CASES:
+    #     if f"off_{c['name']}" in histories:
+    #         h, gf = histories[f"off_{c['name']}"]
+    #         animate_convergence(h, gf, filename=f"cpmp_{c['name']}_off.gif",
+    #                             title=f"{c['label']}  CP-MP (w/o Slingshot)")
+
+    # # ----------------------------------------------------------
+    # # CELL 6 — GIFs: Vanilla Chizat
+    # # ----------------------------------------------------------
+    # print("\n" + "=" * 55)
+    # print("CELL 6 — GIFs  (Vanilla Chizat, raw)")
+    # print("=" * 55)
+    # for c in CASES:
+    #     if f"van_{c['name']}" in histories:
+    #         h, gf = histories[f"van_{c['name']}"]
+    #         animate_convergence(h, gf, filename=f"cpmp_{c['name']}_chizat.gif",
+    #                             title=f"{c['label']}  CP-MP (Vanilla Chizat)")
+
+    # ----------------------------------------------------------
+    # CELL 7 — Cross-Method Comparison Plots
+    # ----------------------------------------------------------
+    print("\n" + "=" * 55)
+    print("CELL 7 — Cross-Method Comparison Plots")
+    print("=" * 55)
+    plot_comparison(
+        histories, cases=CASES,
+        save_prefix="cpmp_compare",
+        ylims={}        # e.g. {'bary': (1e-4, 10), 'gap': (1e-3, 5)}
+    )
+#       ylims ={'bary': (1e-4, 10),
+#               'gap' : (1e-3, 5),
+#               'w2'  : (1e-3, 3),
+#               'ent' : (0, 4),
+#               'f'   : (-1, 1),
+#               'reg' : (1e-4, 2),
+# })
+
+    print("\n✓  All dashboards, GIFs, and comparison plots generated.")
+
+--- cell 1 ---
+# cpmp_sling_fixed.py
+# KEY FIXES:
+# 1. Position step uses PRE-UPDATE weights (saved before weight update)
+# 2. Adaptive clipping: max step scales with weight
+# 3. Mirror Prox correction step uses |alpha|, |beta| (magnitude only) for the
+#    correction gradient application — the slingshot sign lives only in the
+#    prediction step, not the correction step
+# 4. Added entropy + duality gap to history and 4-panel dashboard
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+
+# ==========================================
+# 1. Slingshot Stepsize Scheduler
+# ==========================================
+def get_slingshot_steps(problem_type, t, T, L=None, m=None, M=None, rng=None):
+    rng = rng or np.random.default_rng()
+    if problem_type == "bilinear":
+        k = t // 2
+        r_t = (M + m) / 2 + (M - m) / 2 * np.cos((2 * k + 1) * np.pi / (2 * T))
+        h = 1.0 / np.sqrt(r_t)
+        return (h, -h) if t % 2 == 0 else (-h, h)
+    else:
+        h = 1.0 / (3.0 * L)
+        if t % 2 == 0:
+            return (h, -h) if rng.random() < 0.5 else (-h, h)
+        else:
+            return h, h
+
+# ==========================================
+# 2. Conic Particle Mirror Prox (CP-MP) — Fixed
+# ==========================================
+class ConicParticlesMP:
+    def __init__(self, n, m, d, rng=None):
+        rng = rng or np.random.default_rng()
+        self.a = np.ones(n) / n
+        self.x = rng.uniform(-2, 2, (n, d))
+        self.b = np.ones(m) / m
+        self.y = rng.uniform(-2, 2, (m, d))
+
+    def _step_weights_only(self, a, b, grad_a, grad_b, alpha, beta):
+        """Returns new weights only (log-sum-exp stable)."""
+        log_a = np.log(np.maximum(a, 1e-15)) - alpha * grad_a
+        log_a -= np.max(log_a)
+        a_new = np.exp(log_a); a_new /= a_new.sum()
+
+        log_b = np.log(np.maximum(b, 1e-15)) + beta * grad_b
+        log_b -= np.max(log_b)
+        b_new = np.exp(log_b); b_new /= b_new.sum()
+        return a_new, b_new
+
+    def _step_positions_only(self, a_ref, x, b_ref, y, grad_x, grad_y, alpha, beta):
+        """
+        Position step using REFERENCE weights (pre-update) for preconditioning.
+        Adaptive clip: smaller for heavy particles.
+        """
+        denom_x = np.maximum(a_ref[:, None], 1e-3)
+        step_x = alpha * grad_x / denom_x
+        clip_x = np.minimum(1.0, 0.1 / denom_x)
+        x_new = x - np.clip(step_x, -clip_x, clip_x)
+
+        denom_y = np.maximum(b_ref[:, None], 1e-3)
+        step_y = beta * grad_y / denom_y
+        clip_y = np.minimum(1.0, 0.1 / denom_y)
+        y_new = y + np.clip(step_y, -clip_y, clip_y)
+
+        x_new = np.clip(x_new, -2.5, 2.5)
+        y_new = np.clip(y_new, -2.5, 2.5)
+        return x_new, y_new
+
+    def _full_step(self, a, x, b, y, grad_a, grad_x, grad_b, grad_y, alpha, beta):
+        """Full step: weights then positions (positions use pre-weight-update ref)."""
+        a_ref = a.copy(); b_ref = b.copy()
+        a_new, b_new = self._step_weights_only(a, b, grad_a, grad_b, alpha, beta)
+        x_new, y_new = self._step_positions_only(a_ref, x, b_ref, y, grad_x, grad_y, alpha, beta)
+        return a_new, x_new, b_new, y_new
+
+    def update_mp(self, calc_grads_fn, alpha, beta):
+        """
+        Mirror Prox:
+          Prediction: full step with (alpha, beta) to get predicted state
+          Correction:  apply correction gradients from predicted state,
+                       but use |alpha|, |beta| for the final step magnitude.
+                       The slingshot SIGN was for the prediction; the correction
+                       should always be a genuine descent/ascent step.
+        """
+        # STEP 1: PREDICTION — gradients at current, step with slingshot signs
+        ga1, gx1, gb1, gy1 = calc_grads_fn(self.a, self.x, self.b, self.y)
+        a_p, x_p, b_p, y_p = self._full_step(
+            self.a, self.x, self.b, self.y, ga1, gx1, gb1, gy1, alpha, beta)
+
+        # STEP 2: CORRECTION — gradients at predicted state
+        ga2, gx2, gb2, gy2 = calc_grads_fn(a_p, x_p, b_p, y_p)
+
+        # Apply correction from ORIGINAL state using |alpha|, |beta|
+        # (the sign of the slingshot already shaped the prediction step;
+        #  the correction is a genuine improvement step)
+        self.a, self.x, self.b, self.y = self._full_step(
+            self.a, self.x, self.b, self.y,
+            ga2, gx2, gb2, gy2,
+            abs(alpha), abs(beta)   # <-- KEY FIX: correction always positive
+        )
+
+# ==========================================
+# 3. Objective Functions & Gradients
+# ==========================================
+def f_bilinear(x, y, B):    return float(x @ B @ y)
+def grad_bilinear(x, y, B): return B @ y, B.T @ x
+
+def logcosh(x):
+    s = np.sign(x) * x
+    return s + np.log1p(np.exp(-2*s)) - np.log(2.0)
+
+def f_convex_concave(x, y):    return float(logcosh(x) - logcosh(y))
+def grad_convex_concave(x, y): return np.tanh(x), -np.tanh(y)
+
+def f_sc_sc(x, y, mu=1.0):    return float(0.5*mu*np.sum(x**2) - 0.5*mu*np.sum(y**2) + np.sum(x*y))
+def grad_sc_sc(x, y, mu=1.0): return mu*x + y, -mu*y + x
+
+# ==========================================
+# 4. Diagnostics helpers
+# ==========================================
+def get_weighted_barycenter(weights, positions):
+    return np.sum(weights[:, None] * positions, axis=0)
+
+def entropy(weights):
+    w = np.maximum(weights, 1e-15)
+    return float(-np.sum(w * np.log(w)))
+
+def duality_gap(a, x, b, y, f_func):
+    vals = np.array([[float(f_func(x[i], y[j])) for j in range(len(y))] for i in range(len(x))])
+    return float(np.max(vals.T @ a) - np.min(vals @ b))
+
+# ==========================================
+# 5. Experiment runner
+# ==========================================
+def run_experiment_mp(model, grad_func, f_func, steps=200,
+                      problem_type="bilinear", T=None, L=None, m=None, M=None,
+                      rng=None):
+    rng = rng or np.random.default_rng()
+    T = T or steps
+    history = {'a': [], 'x': [], 'b': [], 'y': [],
+               'barycenter': [], 'entropy_a': [], 'entropy_b': [],
+               'hamiltonian': [], 'gap': []}
+
+    for t in range(steps):
+        history['a'].append(model.a.copy())
+        history['x'].append(model.x.copy())
+        history['b'].append(model.b.copy())
+        history['y'].append(model.y.copy())
+
+        xb = get_weighted_barycenter(model.a, model.x)[0]
+        yb = get_weighted_barycenter(model.b, model.y)[0]
+        history['barycenter'].append((xb, yb))
+        history['entropy_a'].append(entropy(model.a))
+        history['entropy_b'].append(entropy(model.b))
+
+        gx0, gy0 = grad_func(np.array([xb]), np.array([yb]))
+        history['hamiltonian'].append(0.5*(float(np.sum(gx0**2)) + float(np.sum(gy0**2))))
+        history['gap'].append(duality_gap(model.a, model.x, model.b, model.y, f_func) if t % 10 == 0 else np.nan)
+
+        alpha, beta = get_slingshot_steps(problem_type, t, T, L=L, m=m, M=M, rng=rng)
+
+        def compute_grads(a_s, x_s, b_s, y_s):
+            n_, m_ = len(x_s), len(y_s)
+            gx_t = np.zeros_like(x_s); gy_t = np.zeros_like(y_s)
+            ga_t = np.zeros(n_);        gb_t = np.zeros(m_)
+            for i in range(n_):
+                for j in range(m_):
+                    gx, gy = grad_func(x_s[i], y_s[j])
+                    val = float(f_func(x_s[i], y_s[j]))
+                    gx_t[i] += b_s[j] * float(gx)
+                    gy_t[j] += a_s[i] * float(gy)
+                    ga_t[i] += b_s[j] * val
+                    gb_t[j] += a_s[i] * val
+            return ga_t, gx_t, gb_t, gy_t
+
+        model.update_mp(compute_grads, alpha, beta)
+
+    return history
+
+# ==========================================
+# 6. 4-panel dashboard
+# ==========================================
+def plot_dashboard(history, grad_func, title=""):
+    fig, axs = plt.subplots(1, 4, figsize=(20, 5))
+    fig.suptitle(title, fontsize=14, fontweight='bold')
+
+    xs = np.linspace(-3, 3, 80)
+    X, Y = np.meshgrid(xs, xs)
+    Z = np.zeros_like(X)
+    for i in range(X.shape[0]):
+        for j in range(X.shape[1]):
+            gx, gy = grad_func(np.array([X[i,j]]), np.array([Y[i,j]]))
+            Z[i,j] = 0.5*(float(np.sum(gx**2)) + float(np.sum(gy**2)))
+    axs[0].contourf(X, Y, Z, levels=30, cmap='Blues', alpha=0.5)
+
+    traj = np.array(history['barycenter'])
+    mask = ~np.isnan(traj).any(axis=1)
+    tc = traj[mask]
+    if len(tc):
+        axs[0].plot(tc[:,0], tc[:,1], 'k-', lw=2)
+        axs[0].scatter(*tc[0], c='white', edgecolors='k', s=100, zorder=4)
+        axs[0].scatter(*tc[-1], c='yellow', edgecolors='k', marker='*', s=400, zorder=5)
+    a_f, x_f = history['a'][-1], history['x'][-1]
+    b_f, y_f = history['b'][-1], history['y'][-1]
+    axs[0].scatter(x_f[:,0], np.full(len(x_f), -0.05),
+                   s=np.maximum(a_f*2000, 5), c='red', alpha=0.8, edgecolors='k')
+    axs[0].scatter(np.full(len(y_f), 0.05), y_f[:,0],
+                   s=np.maximum(b_f*2000, 5), c='orange', alpha=0.8, edgecolors='k')
+    axs[0].set_xlim(-3,3); axs[0].set_ylim(-3,3); axs[0].set_title("Hamiltonian + Particles")
+
+    if len(tc):
+        dist = np.sqrt(tc[:,0]**2 + tc[:,1]**2)
+        axs[1].semilogy(dist, c='purple', lw=2)
+        axs[1].set_title("Barycenter Dist (log)")
+        axs[1].set_xlabel("Iteration"); axs[1].grid(True, ls='--', alpha=0.5)
+
+    ea = np.array(history['entropy_a']); eb = np.array(history['entropy_b'])
+    axs[2].plot(ea, 'r-', lw=2, label='H(a)')
+    axs[2].plot(eb, color='orange', lw=2, label='H(b)')
+    axs[2].axhline(0, color='k', ls='--', lw=1)
+    axs[2].set_title("Strategy Entropy (↓ → collapse)")
+    axs[2].set_xlabel("Iteration"); axs[2].legend(fontsize=8); axs[2].grid(True, ls='--', alpha=0.5)
+
+    gap = np.array(history['gap'])
+    vi = ~np.isnan(gap)
+    axs[3].semilogy(np.where(vi)[0], gap[vi], 'g-o', lw=2, ms=4)
+    axs[3].axhline(0.01, color='red', ls='--', lw=1, label='ε=0.01')
+    axs[3].set_title("Duality Gap (↓ → Nash)")
+    axs[3].set_xlabel("Iteration"); axs[3].legend(fontsize=8); axs[3].grid(True, ls='--', alpha=0.5)
+
+    plt.tight_layout()
+    return fig
+
+# ==========================================
+# 7. GIF Generator
+# ==========================================
+def animate_convergence(history, grad_func, filename="convergence.gif", title=""):
+    fig, axs = plt.subplots(1, 4, figsize=(20, 5))
+    xs = np.linspace(-3, 3, 80)
+    X, Y = np.meshgrid(xs, xs)
+    Z = np.zeros_like(X)
+    for i in range(X.shape[0]):
+        for j in range(X.shape[1]):
+            gx, gy = grad_func(np.array([X[i,j]]), np.array([Y[i,j]]))
+            Z[i,j] = 0.5*(float(np.sum(gx**2)) + float(np.sum(gy**2)))
+    axs[0].contourf(X, Y, Z, levels=30, cmap='Blues', alpha=0.4)
+    scat_p1 = axs[0].scatter([], [], c='red', edgecolors='k', zorder=5)
+    scat_p2 = axs[0].scatter([], [], c='orange', edgecolors='k', zorder=4)
+    line_bary, = axs[0].plot([], [], 'k-', lw=2, zorder=2)
+    scat_bary = axs[0].scatter([], [], c='yellow', edgecolors='k', marker='*', s=300, zorder=10)
+    axs[0].set_xlim(-3,3); axs[0].set_ylim(-3,3); axs[0].set_title(title)
+
+    steps_range = np.arange(len(history['a']))
+    ea = np.array(history['entropy_a']); eb = np.array(history['entropy_b'])
+
+    def update(frame):
+        a, x = history['a'][frame], history['x'][frame]
+        b, y = history['b'][frame], history['y'][frame]
+        scat_p1.set_offsets(np.c_[x[:,0], np.full(len(x), -0.05)])
+        scat_p1.set_sizes(np.maximum(a*1500, 5))
+        scat_p2.set_offsets(np.c_[np.full(len(y), 0.05), y[:,0]])
+        scat_p2.set_sizes(np.maximum(b*1500, 5))
+        bp = np.array(history['barycenter'][:frame+1])
+        line_bary.set_data(bp[:,0], bp[:,1])
+        scat_bary.set_offsets([bp[-1]])
+
+        axs[1].clear(); axs[1].set_xlim(-3,3); axs[1].set_ylim(0,1.1)
+        axs[1].set_title(f"P1 Mass (H={ea[frame]:.2f})")
+        axs[1].bar(x[:,0], a, width=0.15, color='red', alpha=0.7, edgecolor='k')
+
+        axs[2].clear(); axs[2].set_xlim(-3,3); axs[2].set_ylim(0,1.1)
+        axs[2].set_title(f"P2 Mass (H={eb[frame]:.2f})")
+        axs[2].bar(y[:,0], b, width=0.15, color='orange', alpha=0.7, edgecolor='k')
+
+        axs[3].clear()
+        axs[3].plot(steps_range[:frame+1], ea[:frame+1], 'r-', lw=1.5, label='H(a)')
+        axs[3].plot(steps_range[:frame+1], eb[:frame+1], color='orange', lw=1.5, label='H(b)')
+        axs[3].set_xlim(0, len(history['a']))
+        axs[3].set_ylim(-0.1, np.log(len(a))+0.2)
+        axs[3].set_title("Entropy over time"); axs[3].legend(fontsize=7)
+        axs[3].grid(True, ls='--', alpha=0.4)
+
+    print(f"Generating {filename}...")
+    ani = animation.FuncAnimation(fig, update, frames=len(history['a']), interval=80)
+    ani.save(filename, writer='pillow')
+    plt.close(fig)
+    print("Done!")
+
+# ==========================================
+# 8. Driver
+# ==========================================
+if __name__ == "__main__":
+    rng = np.random.default_rng(42)
+
+    # ---- Case 1: Bilinear ----
+    print("=== Bilinear (CP-MP fixed) ===")
+    B_mat = np.array([[1.0]])
+    model_bl = ConicParticlesMP(n=30, m=30, d=1, rng=rng)
+    history_bl = run_experiment_mp(
+        model_bl,
+        lambda x,y: grad_bilinear(x,y,B_mat),
+        lambda x,y: f_bilinear(x,y,B_mat),
+        steps=100, problem_type="bilinear", m=1.0, M=1.0, rng=rng
+    )
+    fig = plot_dashboard(history_bl, lambda x,y: grad_bilinear(x,y,B_mat),
+                         title="Bilinear - CP-MP Fixed")
+    fig.savefig("cpmp_bilinear_dashboard.png", dpi=100, bbox_inches='tight')
+    plt.close(fig)
+    animate_convergence(history_bl, lambda x,y: grad_bilinear(x,y,B_mat),
+                        filename="cpmp_bilinear.gif", title="Bilinear CP-MP")
+
+    # ---- Case 2: Convex-Concave ----
+    print("\n=== Convex-Concave (CP-MP fixed) ===")
+    model_cc = ConicParticlesMP(n=30, m=30, d=1, rng=rng)
+    history_cc = run_experiment_mp(
+        model_cc, grad_convex_concave, f_convex_concave,
+        steps=200, problem_type="nonlinear", L=1.0, rng=rng
+    )
+    fig = plot_dashboard(history_cc, grad_convex_concave,
+                         title="Convex-Concave - CP-MP Fixed")
+    fig.savefig("cpmp_cc_dashboard.png", dpi=100, bbox_inches='tight')
+    plt.close(fig)
+    animate_convergence(history_cc, grad_convex_concave,
+                        filename="cpmp_cc.gif", title="Conv-Conc CP-MP")
+
+    # ---- Case 3: SC-SC ----
+    print("\n=== SC-SC (CP-MP fixed) ===")
+    model_sc = ConicParticlesMP(n=30, m=30, d=1, rng=rng)
+    history_sc = run_experiment_mp(
+        model_sc,
+        lambda x,y: grad_sc_sc(x,y,mu=1.0),
+        lambda x,y: f_sc_sc(x,y,mu=1.0),
+        steps=150, problem_type="nonlinear", L=np.sqrt(2), rng=rng
+    )
+    fig = plot_dashboard(history_sc, lambda x,y: grad_sc_sc(x,y,mu=1.0),
+                         title="SC-SC - CP-MP Fixed")
+    fig.savefig("cpmp_scsc_dashboard.png", dpi=100, bbox_inches='tight')
+    plt.close(fig)
+    animate_convergence(history_sc, lambda x,y: grad_sc_sc(x,y,mu=1.0),
+                        filename="cpmp_scsc.gif", title="SC-SC CP-MP")
+
+    print("\nAll done!")
+
